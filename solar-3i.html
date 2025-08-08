@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>3I/ATLAS in the Solar System — Three.js</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- ES module imports for Three.js and lil-gui -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+      "lil-gui": "https://unpkg.com/lil-gui@0.19/dist/lil-gui.esm.min.js"
+    }
+  }
+  </script>
+  <style>
+    html, body { margin:0; height:100%; background:#000; color:#ddd; font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial }
+    #app { position:fixed; inset:0 }
+    .label {
+      position: absolute; color:#fff; font-size:12px; pointer-events:none; white-space:nowrap;
+      text-shadow: 0 0 4px rgba(0,0,0,0.7);
+    }
+    .legend {
+      position: absolute; left: 12px; bottom: 12px; color:#bbb; font-size:12px; line-height:1.3;
+      background: rgba(0,0,0,0.35); padding:8px 10px; border:1px solid #333; border-radius:8px;
+    }
+    a { color:#8fd3ff; text-decoration:none }
+  </style>
+</head>
+<body>
+<div id="app"></div>
+<div class="legend">
+  <div><b>Legend</b></div>
+  <div>• Units: 1 = 1 AU (scaled radii)</div>
+  <div>• Time: Terrestrial Time approx.</div>
+  <div>• Simple 2-body Keplerian (no perturbations)</div>
+</div>
+<script type="module">
+  import * as THREE from 'three';
+  import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+  import GUI from 'lil-gui';
+(() => {
+  // ---------- Helpers / Constants ----------
+  const AU = 1;                 // scene unit = 1 AU
+  const DAY = 86400;            // seconds
+  const J2000 = 2451545.0;      // Julian Date
+  const DEG = Math.PI/180;
+  const TWO_PI = Math.PI*2;
+
+  // Simple Julian Date helpers
+  function toJD(date) {
+    // date is JS Date in UTC
+    const t = date.getTime(); // ms
+    return 2440587.5 + (t / 86400000);
+  }
+  function fromJD(jd) {
+    const ms = (jd - 2440587.5) * 86400000;
+    return new Date(ms);
+  }
+
+  // Mod 2π safe
+  const normAngle = (x) => {
+    x = x % TWO_PI;
+    return x < 0 ? x + TWO_PI : x;
+  };
+
+  // Solve Kepler's equation for elliptical orbits (e<1)
+  function solveKeplerElliptic(M, e, tol=1e-8, maxIt=50) {
+    M = ((M % TWO_PI) + TWO_PI) % TWO_PI;
+    let E = e < 0.8 ? M : Math.PI; // initial guess
+    for (let i=0;i<maxIt;i++){
+      const f  = E - e*Math.sin(E) - M;
+      const fp = 1 - e*Math.cos(E);
+      const dE = -f/fp;
+      E += dE;
+      if (Math.abs(dE) < tol) break;
+    }
+    return E;
+  }
+
+  // Solve Kepler for hyperbolic (e>1) using Newton on H - e sinh H = M
+  function solveKeplerHyperbolic(M, e, tol=1e-7, maxIt=50) {
+    // M can be negative/positive (time around periapsis)
+    let H = Math.log(2*Math.abs(M)/e + 1.8); // decent guess
+    if (M < 0) H = -H;
+    for (let i=0;i<maxIt;i++){
+      const sH = Math.sinh(H), cH = Math.cosh(H);
+      const f = e*sH - H - M;
+      const fp = e*cH - 1;
+      const dH = -f/fp;
+      H += dH;
+      if (Math.abs(dH) < tol) break;
+    }
+    return H;
+  }
+
+  // Convert classical elements to heliocentric ecliptic XYZ (AU)
+  // Elements: { a, e, i, Omega, w, M0, epochJD } for e<1
+  // Hyperbolic: { q, e, i, Omega, w, Tp } (use q=eccentric perihelion distance; a = q/(1-e))
+  function keplerToPosition(el, jd) {
+    const cos = Math.cos, sin = Math.sin, sqrt = Math.sqrt;
+
+    let a, e=el.e, i=el.i*DEG, O=el.Omega*DEG, w=el.w*DEG;
+
+    if (e < 1) {
+      // Elliptical
+      a = el.a; // AU
+      const n = Math.sqrt(1.32712440018e20) ; // unused; we’ll use mean motion via a (but we’re in AU/s if we go SI)
+      // Simpler: use mean motion in rad/day: n = k / a^(3/2), with k≈0.01720209895 rad/day (Gaussian gravitational constant)
+      const k = 0.01720209895; // rad/day
+      const n_rad_per_day = k / Math.pow(a, 1.5);
+      const dtDays = jd - (el.epochJD || J2000);
+      const M = normAngle((el.M0*DEG) + n_rad_per_day*dtDays);
+      const E = solveKeplerElliptic(M, e);
+      const cosE = cos(E), sinE = sin(E);
+      const r = a*(1 - e*cosE);
+      const xp = a*(cosE - e);
+      const yp = a*sqrt(1-e*e)*sinE;
+      // rotate by argument of perihelion w, then Ω, then inclination i
+      const cosw = cos(w), sinw = sin(w);
+      const cosO = cos(O), sinO = sin(O);
+      const cosi = cos(i), sini = sin(i);
+
+      const x1 = xp*cosw - yp*sinw;
+      const y1 = xp*sinw + yp*cosw;
+      const z1 = 0;
+
+      const x2 = x1;
+      const y2 = y1*cosi;
+      const z2 = y1*sini;
+
+      const x = x2*cosO - y2*sinO;
+      const y = x2*sinO + y2*cosO;
+      const z = z2;
+
+      return { x, y, z, r };
+    } else {
+      // Hyperbolic using q, e, Tp
+      const q = el.q;                 // perihelion distance (AU)
+      a = q/(e-1);                    // a < 0
+      const k = 0.01720209895;        // rad/day
+      const n = k / Math.pow(Math.abs(a), 1.5); // "mean motion" magnitude
+      const tDays = jd - el.Tp;       // time since perihelion (days)
+      const M = n * tDays;            // hyperbolic mean anomaly (signed)
+      const H = solveKeplerHyperbolic(M, e);
+      const coshH = Math.cosh(H), sinhH = Math.sinh(H);
+      const r = a*(e*coshH - 1);      // will be positive (a<0)
+      const xp = a*(coshH - e);
+      const yp = a*Math.sqrt(e*e - 1)*sinhH;
+
+      const cosw = cos(w), sinw = sin(w);
+      const cosO = cos(O), sinO = sin(O);
+      const cosi = cos(i), sini = sin(i);
+
+      const x1 = xp*cosw - yp*sinw;
+      const y1 = xp*sinw + yp*cosw;
+
+      const x2 = x1;
+      const y2 = y1*cosi;
+      const z2 = y1*sini;
+
+      const x = x2*cosO - y2*sinO;
+      const y = x2*sinO + y2*cosO;
+      const z = z2;
+
+      return { x, y, z, r: Math.abs(r) };
+    }
+  }
+
+  // ---------- Scene ----------
+  const root = document.getElementById('app');
+  const renderer = new THREE.WebGLRenderer({ antialias:true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  root.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x000000);
+
+  const camera = new THREE.PerspectiveCamera(55, window.innerWidth/window.innerHeight, 0.001, 5000);
+  camera.position.set(0, 15, 35);
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+
+  // Lighting
+  scene.add(new THREE.AmbientLight(0x404040, 0.6));
+  const sunLight = new THREE.PointLight(0xffffff, 2.2, 0, 2);
+  scene.add(sunLight);
+
+  // Stars backdrop
+  const starGeo = new THREE.BufferGeometry();
+  const starCount = 5000;
+  const starPos = new Float32Array(starCount*3);
+  for (let i=0;i<starCount;i++){
+    const r = 200 + Math.random()*600;
+    const th = Math.random()*Math.PI;
+    const ph = Math.random()*TWO_PI;
+    starPos[i*3+0] = r*Math.sin(th)*Math.cos(ph);
+    starPos[i*3+1] = r*Math.cos(th);
+    starPos[i*3+2] = r*Math.sin(th)*Math.sin(ph);
+  }
+  starGeo.setAttribute('position', new THREE.BufferAttribute(starPos,3));
+  const starMat = new THREE.PointsMaterial({ size: 0.5, sizeAttenuation: true, depthWrite:false });
+  scene.add(new THREE.Points(starGeo, starMat));
+
+  // Sun
+  const sun = new THREE.Mesh(
+    new THREE.SphereGeometry(0.5, 48, 32),
+    new THREE.MeshBasicMaterial({ color: 0xffcc55 })
+  );
+  scene.add(sun);
+
+  // ---------- Orbital data (simple mean elements) ----------
+  // Epochs in JD; values are rough/illustrative for demo (not ephemeris-grade).
+  // You can swap these for more accurate sets or fetch at runtime from an API.
+  const elements = [
+    // name, color, radiusScale(AU), type, elements
+    {
+      name: 'Mercury', color: 0xaaaaaa, size: 0.009, type:'elliptic',
+      el: { a:0.38709927, e:0.20563593, i:7.00497902, Omega:48.33076593, w:29.12703035, M0:174.795884, epochJD: J2000 }
+    },
+    {
+      name: 'Venus', color: 0xffcc88, size: 0.023, type:'elliptic',
+      el: { a:0.72333566, e:0.00677672, i:3.39467605, Omega:76.67984255, w:54.92262463, M0: 50.416143, epochJD: J2000 }
+    },
+  ];
+
+
+
+  elements.push(
+    {
+      name: 'Earth', color: 0x6699ff, size: 0.012, type:'elliptic',
+      el: { a:1.00000261, e:0.01671123, i:-0.00001531, Omega:0.0, w:102.93768193, M0:100.46457166, epochJD:J2000 }
+    },
+    {
+      name: 'Moon', color: 0xdddddd, size: 0.003, type:'moon',
+      parent: 'Earth', distAU: 0.01, periodDays: 27.321661, incDeg: 5.14 // visual-only tweaks
+    },
+    {
+      name: 'Mars', color: 0xff5533, size: 0.013, type:'elliptic',
+      el: { a:1.52371034, e:0.09339410, i:1.84969142, Omega:49.55953891, w:286.537, M0:355.45332, epochJD:J2000 }
+    },
+    {
+      name: 'Ceres', color: 0x88ccff, size: 0.008, type:'elliptic',
+      el: { a:2.767, e:0.076, i:10.593, Omega:80.305, w:73.597, M0:95.989, epochJD:J2000 }
+    },
+    {
+      name: 'Vesta', color: 0xffaa88, size: 0.008, type:'elliptic',
+      el: { a:2.361, e:0.089, i:7.140, Omega:103.85, w:151.20, M0:20.0, epochJD:J2000 }
+    },
+    {
+      name: 'Jupiter', color: 0xffddaa, size: 0.26, type:'elliptic',
+      el: { a:5.20288700, e:0.04838624, i:1.30439695, Omega:100.47390909, w:14.72847983, M0:34.39644051, epochJD:J2000 }
+    },
+    {
+      name: 'Saturn', color: 0xffeecc, size: 0.22, type:'elliptic',
+      el: { a:9.53667594, e:0.05386179, i:2.48599187, Omega:113.66242448, w:92.59887831, M0:49.95424423, epochJD:J2000 }
+    },
+    {
+      name: 'Uranus', color: 0x88ddff, size: 0.19, type:'elliptic',
+      el: { a:19.18916464, e:0.04725744, i:0.77263783, Omega:74.01692503, w:170.95427630, M0:313.23810451, epochJD:J2000 }
+    },
+    {
+      name: 'Neptune', color: 0x88aaff, size: 0.19, type:'elliptic',
+      el: { a:30.06992276, e:0.00859048, i:1.77004347, Omega:131.78422574, w:44.96476227, M0:304.88003, epochJD:J2000 }
+    },
+    {
+      name: 'Pluto', color: 0xbbccff, size: 0.05, type:'elliptic',
+      el: { a:39.48211675, e:0.24882730, i:17.14001206, Omega:110.30393684, w:224.06891629, M0:238.92903833, epochJD:J2000 }
+    },
+    // ---------- 3I/ATLAS (placeholder hyperbolic elements) ----------
+    // TODO: Replace the numbers below with the official published values.
+    // Required: q (AU), e (>1), i (deg), Omega (deg), w (deg), Tp (Julian Date at perihelion)
+    {
+      name: '3I/ATLAS', color: 0xff66ff, size: 0.03, type:'hyperbolic',
+      el: {
+        q: 1.36,           // perihelion distance [AU]  (← put real)
+        e: 1.25,           // eccentricity (>1)         (← put real)
+        i: 45.0,           // inclination [deg]         (← put real)
+        Omega: 250.0,      // longitude of ascending node [deg] (← put real)
+        w: 60.0,           // argument of perihelion [deg]      (← put real)
+        Tp: 2460605.0      // JD of perihelion (e.g., Oct 29, 2025 ≈ 2460605) (← verify)
+      }
+    }
+  );
+
+  // ---------- Build bodies ----------
+  const bodies = new Map();
+  const trailMax = 2000;
+  const trails = new Map();
+
+  const sphereMatCache = new Map();
+  function sphereMaterial(color) {
+    if (!sphereMatCache.has(color)) {
+      sphereMatCache.set(color, new THREE.MeshStandardMaterial({
+        color, roughness: 0.8, metalness: 0.1
+      }));
+    }
+    return sphereMatCache.get(color);
+  }
+
+  function makeTrail(color=0xffffff, length=1024) {
+    const geo = new THREE.BufferGeometry();
+    const pos = new Float32Array(length*3);
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    const mat = new THREE.LineBasicMaterial({ linewidth: 1, opacity: 0.5, transparent: true, color });
+    const line = new THREE.Line(geo, mat);
+    line.userData = { length, index: 0, filled: false, positions: pos };
+    scene.add(line);
+    return line;
+  }
+
+  function pushTrail(line, v) {
+    const ud = line.userData;
+    const i = ud.index % ud.length;
+    ud.positions[i*3+0] = v.x;
+    ud.positions[i*3+1] = v.y;
+    ud.positions[i*3+2] = v.z;
+    ud.index++;
+    if (ud.index >= ud.length) ud.filled = true;
+    // rotate buffer for a fading effect? (keep simple: just rewrite)
+    line.geometry.attributes.position.needsUpdate = true;
+  }
+
+  // Body meshes
+  elements.forEach(cfg => {
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(cfg.size, 24, 16),
+      sphereMaterial(cfg.color)
+    );
+    scene.add(mesh);
+    bodies.set(cfg.name, { cfg, mesh });
+
+    // Show rings for Saturn (very simple)
+    if (cfg.name === 'Saturn') {
+      const ringGeo = new THREE.RingGeometry(0.28, 0.45, 64);
+      const ringMat = new THREE.MeshBasicMaterial({ color: 0xddddcc, side: THREE.DoubleSide, transparent:true, opacity:0.6 });
+      const ring = new THREE.Mesh(ringGeo, ringMat);
+      ring.rotation.x = Math.PI/2;
+      mesh.add(ring);
+    }
+
+    if (cfg.type !== 'moon') {
+      const line = makeTrail(cfg.color, 1600);
+      trails.set(cfg.name, line);
+    }
+  });
+
+  // Orbit line helper (draw many points along path for each elliptic body)
+  function drawOrbitCurve(cfg) {
+    if (cfg.type === 'elliptic') {
+      const pts = [];
+      const steps = 1024;
+      const el = cfg.el;
+      for (let k=0;k<=steps;k++){
+        const f = k/steps;
+        const M = (f*TWO_PI); // param across mean anomaly
+        // Fake a "jd" by inverting M at epoch
+        const tempEl = { ...el, M0: (M/DEG), epochJD: el.epochJD };
+        const pos = keplerToPosition(tempEl, el.epochJD); // jd=epoch uses M0 directly
+        pts.push(new THREE.Vector3(pos.x, pos.y, pos.z));
+      }
+      const curveGeo = new THREE.BufferGeometry().setFromPoints(pts);
+      const curveMat = new THREE.LineBasicMaterial({ color: cfg.color, opacity:0.25, transparent:true });
+      const curve = new THREE.Line(curveGeo, curveMat);
+      scene.add(curve);
+    }
+    // For hyperbolic we skip (could draw a segment range around perihelion if desired)
+  }
+  elements.forEach(drawOrbitCurve);
+
+  // Labels (CSS2D would be nicer, but we’ll hack it)
+  const labels = [];
+  function addLabel(name) {
+    const el = document.createElement('div');
+    el.className = 'label';
+    el.textContent = name;
+    document.body.appendChild(el);
+    labels.push({ name, el });
+  }
+  elements.forEach(e => addLabel(e.name));
+  addLabel('Sun');
+
+  // ---------- Simulation state ----------
+  const state = {
+    jd: toJD(new Date()),        // start "now"
+    speedDaysPerSec: 5,          // sim speed
+    running: true,
+    showTrails: true,
+    follow: 'Sun',
+    scaleZ: 1.0,                 // vertical exaggeration for fun
+    setNow: () => { state.jd = toJD(new Date()); },
+    jumpDate: (iso) => { const d=new Date(iso); if(!isNaN(d)) state.jd=toJD(d); },
+  };
+
+  const gui = new GUI();
+  gui.add(state, 'running').name('Run');
+  gui.add(state, 'speedDaysPerSec', -200, 200, 1).name('Speed (days/s)');
+  gui.add(state, 'showTrails').name('Trails');
+  gui.add(state, 'scaleZ', 0.2, 5.0, 0.1).name('Z Scale');
+  gui.add({ now: state.setNow }, 'now').name('Jump to Now');
+  const dateCtrl = gui.add({ date: fromJD(state.jd).toISOString().slice(0,10) }, 'date').name('Jump (YYYY-MM-DD)');
+  dateCtrl.onFinishChange(v => state.jumpDate(v));
+  gui.add(state, 'follow', ['Sun', ...elements.map(e=>e.name)]).name('Follow');
+
+  // Add Clear Trails button
+  function clearAllTrails() {
+    trails.forEach(line => {
+      const ud = line.userData;
+      ud.index = 0;
+      ud.filled = false;
+      ud.positions.fill(0);
+      line.geometry.attributes.position.needsUpdate = true;
+    });
+  }
+  gui.add({ clear: clearAllTrails }, 'clear').name('Clear Trails');
+
+  // ---------- Update loop ----------
+  let last = performance.now();
+  function update() {
+    const t = performance.now();
+    const dt = (t - last)/1000; // seconds
+    last = t;
+
+    if (state.running) {
+      state.jd += state.speedDaysPerSec * (dt);
+    }
+
+    // Sun at origin
+    sun.position.set(0,0,0);
+    sunLight.position.copy(sun.position);
+
+    // Compute planet positions
+    const positions = new Map();
+    elements.forEach(cfg => {
+      const body = bodies.get(cfg.name);
+      let pos;
+      if (cfg.type === 'elliptic') {
+        pos = keplerToPosition(cfg.el, state.jd);
+      } else if (cfg.type === 'hyperbolic') {
+        pos = keplerToPosition(cfg.el, state.jd);
+      } else if (cfg.type === 'moon') {
+        const parentPos = positions.get(cfg.parent) || { x:0,y:0,z:0 };
+        const T = (state.jd - J2000) * (TWO_PI / cfg.periodDays);
+        const inc = (cfg.incDeg || 5.0) * DEG; // small inclination
+        const cosi = Math.cos(inc), sini = Math.sin(inc);
+        const xp = cfg.distAU * Math.cos(T);
+        const yp = cfg.distAU * Math.sin(T);
+        const x = parentPos.x + xp;
+        const y = parentPos.y + yp*cosi;
+        const z = parentPos.z + yp*sini + 0.001; // tiny bias to avoid overlap
+        pos = { x, y, z, r: cfg.distAU };
+      } else {
+        pos = { x:0, y:0, z:0, r:0 };
+      }
+
+      // vertical exaggeration option
+      const v = new THREE.Vector3(pos.x, pos.y, pos.z*state.scaleZ);
+      body.mesh.position.copy(v);
+      positions.set(cfg.name, { x:v.x, y:v.y, z:v.z });
+
+      const tr = trails.get(cfg.name);
+      if (tr && state.showTrails) pushTrail(tr, v);
+    });
+
+    // Labels
+    function projectToScreen(vec3){
+      const v = vec3.clone().project(camera);
+      const x = (v.x*0.5 + 0.5) * renderer.domElement.clientWidth;
+      const y = (-v.y*0.5 + 0.5) * renderer.domElement.clientHeight;
+      return { x, y, behind: v.z>1 || v.z<-1 };
+    }
+    labels.forEach(({name, el})=>{
+      let p;
+      if (name==='Sun') p = sun.position;
+      else p = bodies.get(name).mesh.position;
+      const s = projectToScreen(p);
+      el.style.transform = `translate(${s.x}px, ${s.y}px)`;
+      el.style.opacity = s.behind ? 0 : 1;
+    });
+
+    // Follow target
+    const targetName = state.follow;
+    const targetPos = (targetName==='Sun') ? sun.position : bodies.get(targetName).mesh.position;
+    controls.target.lerp(targetPos, 0.1);
+    controls.update();
+  }
+
+  function render() {
+    update();
+    renderer.render(scene, camera);
+    requestAnimationFrame(render);
+  }
+  render();
+
+  window.addEventListener('resize', () => {
+    renderer.setSize(innerWidth, innerHeight);
+    camera.aspect = innerWidth/innerHeight;
+    camera.updateProjectionMatrix();
+  });
+
+  // ---------- Developer Notes ----------
+  // • To plug accurate elements for 3I/ATLAS:
+  //   bodies.get('3I/ATLAS').cfg.el = {
+  //     q: <perihelion AU>, e: <ecc> (>1), i: <deg>, Omega: <deg>, w: <deg>, Tp: <JD of perihelion>
+  //   };
+  // • For planets, mean elements are fine for a viz. For precision/long spans,
+  //   use VSOP87/DE ephemerides or fetch from JPL Horizons.
+  // • Trails can be long; lower trail length in makeTrail() if perf dips.
+})();
+</script>
+</body>
+</html>
